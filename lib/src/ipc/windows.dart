@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
+import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -10,6 +12,9 @@ import 'package:discord_rich_presence/src/ipc/ipc.dart';
 
 class WindowsIPC extends UniversalIPC {
   int? _handle;
+  StreamSubscription? _subscription;
+  ReceivePort? _receivePort;
+
   final _streamController = StreamController<String>();
 
   @override
@@ -17,87 +22,96 @@ class WindowsIPC extends UniversalIPC {
     if (_handle == null) {
       return;
     }
+
+    _subscription?.cancel();
+    _receivePort?.close();
+    CloseHandle(_handle!);
+    _handle = null;
+  }
+
+  void _startListening() async {
+    _receivePort = ReceivePort();
+    await Isolate.spawn(_listen, [_handle, _receivePort!.sendPort]);
+    _subscription = _receivePort!.listen((message) {
+      _streamController.add(message);
+    });
+  }
+
+  static void _listen(List args) {
+    final handle = args[0] as int;
+    final sendPort = args[1] as SendPort;
+    final lpBuffer = wsalloc(128);
+    final lpNumBytesRead = calloc<DWORD>();
+
+    try {
+      while (true) {
+        final bytesRead = calloc<Uint32>();
+
+        try {
+          final result = ReadFile(
+            handle,
+            lpBuffer.cast(),
+            128,
+            lpNumBytesRead,
+            nullptr,
+          );
+
+          if (result != NULL) {
+            final message = lpBuffer.toDartString();
+            sendPort.send(message);
+          } else {
+            stdout
+                .writeln('Failed to read from pipe. Error: ${GetLastError()}');
+          }
+        } finally {
+          free(bytesRead);
+        }
+      }
+    } finally {
+      free(lpBuffer);
+      free(lpNumBytesRead);
+    }
   }
 
   @override
   Future<void> connectIpc() async {
     for (int i = 0; i < 10; i++) {
+      final pipeNamePtr = TEXT(r'\\.\pipe\discord-ipc-' + i.toString());
       try {
-        final pipeName = r'\\.\pipe\discord-ipc-' + i.toString();
+        while (true) {
+          _handle = CreateFile(
+            pipeNamePtr,
+            GENERIC_ACCESS_RIGHTS.GENERIC_READ,
+            FILE_SHARE_MODE.FILE_SHARE_READ | FILE_SHARE_MODE.FILE_SHARE_WRITE,
+            nullptr,
+            FILE_CREATION_DISPOSITION.OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES.FILE_ATTRIBUTE_NORMAL,
+            NULL,
+          );
 
-        _handle = CreateNamedPipe(
-          TEXT(pipeName),
-          FILE_FLAGS_AND_ATTRIBUTES.PIPE_ACCESS_DUPLEX,
-          NAMED_PIPE_MODE.PIPE_TYPE_BYTE |
-              NAMED_PIPE_MODE.PIPE_READMODE_BYTE |
-              NAMED_PIPE_MODE.PIPE_WAIT,
-          1,
-          0,
-          0,
-          0,
-          nullptr,
-        );
-
-        if (_handle == INVALID_HANDLE_VALUE) {
-          throw WindowsException(HRESULT_FROM_WIN32(GetLastError()));
+          if (_handle != INVALID_HANDLE_VALUE) {
+            break;
+          } else {
+            final error = GetLastError();
+            if (error != WIN32_ERROR.ERROR_PIPE_BUSY) {
+              stderr.writeln('Failed to connect to named pipe. Error: $error');
+              return;
+            }
+            stdout.writeln('Waiting for client to connect...');
+            Sleep(1000); // Wait for 1 second before retrying
+          }
         }
+
+        stdout.writeln('Client connected to \\\\.\\pipe\\discord-ipc-$i');
+        _startListening();
+        break;
       } catch (e) {
         print('Failed to connect to pipe: $e');
         continue;
+      } finally {
+        free(pipeNamePtr);
       }
     }
-
-    if (_handle == null) {
-      throw WindowsException(HRESULT_FROM_WIN32(GetLastError()));
-    }
-
-    // non blocking read file loop. We can use unpack to know the size of the next message
-    // and then read that amount of bytes
-    await Future(() async {
-      while (true) {
-        final data = calloc<Uint8>(4096);
-        final read = calloc<Uint32>();
-
-        final success = ReadFile(
-          _handle!,
-          data,
-          8,
-          read,
-          nullptr,
-        );
-
-        if (success == 0) {
-          throw WindowsException(HRESULT_FROM_WIN32(GetLastError()));
-        }
-
-        final size = data.asTypedList(8).buffer.asByteData().getUint64(0);
-
-        calloc.free(data);
-        calloc.free(read);
-
-        final data2 = calloc<Uint8>(size);
-        final read2 = calloc<Uint32>();
-
-        final success2 = ReadFile(
-          _handle!,
-          data2,
-          size,
-          read2,
-          nullptr,
-        );
-
-        if (success2 == 0) {
-          throw WindowsException(HRESULT_FROM_WIN32(GetLastError()));
-        }
-
-        final json = utf8.decode(data2.asTypedList(size));
-
-        _streamController.add(json);
-
-        calloc.free(data2);
-        calloc.free(read2);
-      }
-    });
   }
 
   void write(Uint8List data) {
@@ -111,7 +125,7 @@ class WindowsIPC extends UniversalIPC {
 
     dataPtr.asTypedList(data.lengthInBytes).setAll(0, data);
 
-    final written = calloc<Uint32>();
+    final written = calloc<DWORD>();
 
     final success = WriteFile(
       _handle!,
@@ -121,7 +135,7 @@ class WindowsIPC extends UniversalIPC {
       nullptr,
     );
 
-    if (success == 0) {
+    if (success == INVALID_HANDLE_VALUE) {
       throw WindowsException(HRESULT_FROM_WIN32(GetLastError()));
     }
 

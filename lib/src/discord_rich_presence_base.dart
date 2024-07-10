@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:discord_rich_presence/src/ipc/ipc.dart';
 import 'package:discord_rich_presence/src/ipc/unix.dart';
+import 'package:discord_rich_presence/src/ipc/windows.dart';
 import 'package:discord_rich_presence/src/models/activity.dart';
 import 'package:uuid/uuid.dart';
 
@@ -16,7 +17,7 @@ class DiscordRPC {
 
   DiscordRPC(this.clientId) {
     if (Platform.isWindows) {
-      // ipc = WindowsIPC();
+      _ipc = WindowsIPC();
     } else {
       _ipc = UnixIPC();
     }
